@@ -1,0 +1,447 @@
+"""
+MillionDollarsToday.com — Purchasing Power & Wealth Tracker API
+MVP: Real inflation-adjusted calculations using official CPI data.
+"""
+
+import json
+import math
+from datetime import datetime, date
+from typing import Optional, List, Literal
+from enum import Enum
+
+import httpx
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+# =============================================================================
+# APP SETUP
+# =============================================================================
+
+app = FastAPI(
+    title="MillionDollarsToday — Purchasing Power API",
+    description="Real-world inflation-adjusted wealth tracker for consumers and small investors. "
+                "Calculate what $1M (or any amount) in any year is worth today.",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    contact={"name": "MillionDollarsToday", "url": "https://milliondollarstoday.com"},
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =============================================================================
+# CPI DATA — Hardcoded from official BLS data (annual averages)
+# Source: U.S. Bureau of Labor Statistics CPI-U (1982-84=100)
+# Current: Apr 2026 = 333.020
+# =============================================================================
+
+CPI_DATA = {
+    1913: 9.9, 1914: 10.0, 1915: 10.1, 1916: 10.9, 1917: 12.8,
+    1918: 15.1, 1919: 17.3, 1920: 20.0, 1921: 17.9, 1922: 16.8,
+    1923: 17.1, 1924: 17.1, 1925: 17.5, 1926: 17.7, 1927: 17.4,
+    1928: 17.1, 1929: 17.1, 1930: 16.7, 1931: 15.2, 1932: 13.7,
+    1933: 13.0, 1934: 13.4, 1935: 13.7, 1936: 13.9, 1937: 14.4,
+    1938: 14.1, 1939: 13.9, 1940: 14.0, 1941: 14.7, 1942: 16.3,
+    1943: 17.3, 1944: 17.6, 1945: 18.0, 1946: 19.5, 1947: 22.3,
+    1948: 24.1, 1949: 23.8, 1950: 24.1, 1951: 26.0, 1952: 26.5,
+    1953: 26.7, 1954: 26.9, 1955: 26.8, 1956: 27.2, 1957: 28.1,
+    1958: 28.9, 1959: 29.1, 1960: 29.6, 1961: 29.9, 1962: 30.2,
+    1963: 30.6, 1964: 31.0, 1965: 31.5, 1966: 32.4, 1967: 33.4,
+    1968: 34.8, 1969: 36.7, 1970: 38.8, 1971: 40.5, 1972: 41.8,
+    1973: 44.4, 1974: 49.3, 1975: 53.8, 1976: 56.9, 1977: 60.6,
+    1978: 65.2, 1979: 72.6, 1980: 82.4, 1981: 90.9, 1982: 96.5,
+    1983: 99.6, 1984: 103.9, 1985: 107.6, 1986: 109.6, 1987: 113.6,
+    1988: 118.3, 1989: 124.0, 1990: 130.7, 1991: 136.2, 1992: 140.3,
+    1993: 144.5, 1994: 148.2, 1995: 152.4, 1996: 156.9, 1997: 160.5,
+    1998: 163.0, 1999: 166.6, 2000: 172.2, 2001: 177.1, 2002: 179.9,
+    2003: 184.0, 2004: 188.9, 2005: 195.3, 2006: 201.6, 2007: 207.3,
+    2008: 215.3, 2009: 214.5, 2010: 218.1, 2011: 224.9, 2012: 229.6,
+    2013: 233.0, 2014: 236.7, 2015: 237.0, 2016: 240.0, 2017: 245.1,
+    2018: 251.1, 2019: 255.7, 2020: 258.8, 2021: 271.0, 2022: 292.7,
+    2023: 304.7, 2024: 313.7, 2025: 321.9,
+}
+
+# Current CPI (Apr 2026) — updated monthly from BLS
+CURRENT_CPI = 333.02
+CURRENT_MONTH = "Apr 2026"
+
+# =============================================================================
+# ASSET CLASS RETURN DATA (nominal annualized, 1928-2025)
+# Source: NYU Stern, S&P 500, FRED, Case-Shiller, World Gold Council
+# =============================================================================
+
+ASSET_CLASSES = {
+    "stocks_sp500": {
+        "name": "S&P 500 (Stocks)",
+        "nominal_return": 0.100,   # ~10% CAGR nominal
+        "real_return": 0.069,      # ~6.9% real
+        "volatility": 0.155,
+        "description": "US large-cap stocks",
+    },
+    "bonds_10yr": {
+        "name": "10-Year Treasury Bonds",
+        "nominal_return": 0.053,   # ~5.3%
+        "real_return": 0.022,
+        "volatility": 0.070,
+        "description": "US government 10-year bonds",
+    },
+    "real_estate": {
+        "name": "Real Estate (Case-Shiller)",
+        "nominal_return": 0.065,   # ~6.5%
+        "real_return": 0.034,
+        "volatility": 0.090,
+        "description": "US residential real estate",
+    },
+    "gold": {
+        "name": "Gold",
+        "nominal_return": 0.081,   # ~8.1%
+        "real_return": 0.050,
+        "volatility": 0.145,
+        "description": "Gold bullion",
+    },
+    "crypto_bitcoin": {
+        "name": "Bitcoin (Crypto)",
+        "nominal_return": 0.50,    # ~50% historically — high volatility
+        "real_return": 0.47,
+        "volatility": 0.80,
+        "description": "Bitcoin (extremely volatile, short history)",
+    },
+    "cash": {
+        "name": "Cash / Savings",
+        "nominal_return": 0.025,   # ~2.5% HYSA
+        "real_return": -0.006,
+        "volatility": 0.005,
+        "description": "High-yield savings account",
+    },
+    "prepper_basket": {
+        "name": "Preparedness Basket",
+        "nominal_return": None,    # Not an investment
+        "real_return": None,
+        "volatility": None,
+        "description": "Custom basket: food, ammo, generators, seeds — tracks real cost",
+    },
+}
+
+# Category-specific inflation rates (approximate, 2024-2026)
+CATEGORY_INFLATION = {
+    "official_cpi": 0.031,        # Official CPI average
+    "food": 0.045,                # Food inflation
+    "housing": 0.050,             # Shelter/housing
+    "healthcare": 0.060,          # Medical care
+    "energy": 0.040,              # Energy
+    "education": 0.055,           # Tuition/school
+    "transportation": 0.035,      # Vehicles/transport
+    "prepper_basket": 0.070,      # Prepper goods (higher volatility)
+}
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def get_cpi(year: int) -> float:
+    """Get CPI value for a given year. Raises if not found."""
+    cpi = CPI_DATA.get(year)
+    if cpi is None:
+        raise HTTPException(status_code=404, detail=f"No CPI data available for year {year}")
+    return cpi
+
+
+def inflation_adjust(amount: float, from_year: int, to_year: int) -> dict:
+    """
+    Calculate inflation-adjusted value from one year to another.
+    Returns detailed breakdown.
+    """
+    cpi_from = get_cpi(from_year)
+    cpi_to = get_cpi(to_year) if to_year in CPI_DATA else CURRENT_CPI
+
+    ratio = cpi_to / cpi_from
+    adjusted = round(amount * ratio, 2)
+    raw_loss = round(amount - adjusted, 2)
+    pct_change = round((ratio - 1) * 100, 2)
+
+    return {
+        "original_amount": amount,
+        "original_year": from_year,
+        "target_year": to_year,
+        "original_cpi": cpi_from,
+        "target_cpi": cpi_to,
+        "adjusted_value": adjusted,
+        "purchasing_power_lost": abs(raw_loss) if raw_loss < 0 else 0,
+        "purchasing_power_gained": raw_loss if raw_loss > 0 else 0,
+        "percent_change": pct_change,
+        "ratio": round(ratio, 4),
+        "interpretation": (
+            f"${amount:,.0f} in {from_year} has the same purchasing power "
+            f"as ${adjusted:,.0f} in {to_year} (based on official CPI)."
+        ),
+    }
+
+
+def wealth_erosion_simulation(
+    principal: float,
+    years: int,
+    asset_class: str,
+    inflation_scenario: str = "official_cpi"
+) -> dict:
+    """
+    Simulate nominal vs. real growth for an asset class over N years.
+    """
+    if asset_class not in ASSET_CLASSES:
+        raise HTTPException(status_code=404, detail=f"Unknown asset class: {asset_class}")
+
+    asset = ASSET_CLASSES[asset_class]
+    if asset["nominal_return"] is None:
+        raise HTTPException(status_code=400, detail=f"{asset['name']} has no return data (not an investment)")
+
+    annual_inflation = CATEGORY_INFLATION.get(inflation_scenario, CATEGORY_INFLATION["official_cpi"])
+
+    nominal_return = asset["nominal_return"]
+    real_return = asset["real_return"]
+
+    # Year-by-year projection
+    yearly = []
+    for y in range(1, years + 1):
+        nominal_value = principal * ((1 + nominal_return) ** y)
+        real_value = principal * ((1 + real_return) ** y)
+        inflation_eroded = principal * ((1 + annual_inflation) ** y)
+        yearly.append({
+            "year": y,
+            "nominal_value": round(nominal_value, 2),
+            "real_value": round(real_value, 2),
+            "inflation_eroded_purchasing_power": round(inflation_eroded, 2),
+            "gain_over_inflation": round(nominal_value - inflation_eroded, 2),
+        })
+
+    final = yearly[-1]
+    total_return_nominal = round(((final["nominal_value"] / principal) - 1) * 100, 2)
+    total_return_real = round(((final["real_value"] / principal) - 1) * 100, 2)
+    inflation_total = round(((final["inflation_eroded_purchasing_power"] / principal) - 1) * 100, 2)
+
+    return {
+        "principal": principal,
+        "asset_class": asset["name"],
+        "asset_class_id": asset_class,
+        "years": years,
+        "inflation_scenario": inflation_scenario,
+        "inflation_rate": annual_inflation,
+        "nominal_return_rate": nominal_return,
+        "real_return_rate": real_return,
+        "final_nominal_value": final["nominal_value"],
+        "final_real_value": final["real_value"],
+        "inflation_eroded_value_needed": final["inflation_eroded_purchasing_power"],
+        "total_return_nominal_pct": total_return_nominal,
+        "total_return_real_pct": total_return_real,
+        "total_inflation_pct": inflation_total,
+        "yearly": yearly,
+        "interpretation": (
+            f"If you invested ${principal:,.0f} in {asset['name']} for {years} years, "
+            f"it would grow to ${final['nominal_value']:,.0f} nominally, "
+            f"but after inflation it would be worth ${final['real_value']:,.0f} in today's dollars. "
+            f"To maintain purchasing power, you'd need ${final['inflation_eroded_purchasing_power']:,.0f}."
+        ),
+    }
+
+
+def future_projection(amount: float, years: int, inflation_rate: Optional[float] = None) -> dict:
+    """
+    Project what an amount will be worth in the future under various inflation scenarios.
+    """
+    scenarios = []
+
+    rates_to_test = {}
+    if inflation_rate is not None:
+        rates_to_test["custom"] = inflation_rate
+    else:
+        rates_to_test = {
+            "low (2% — Fed target)": 0.02,
+            "moderate (3.1% — historical avg)": 0.031,
+            "high (5% — persistent)": 0.05,
+            "extreme (8% — 2022-style)": 0.08,
+            "prepper_basket (7%)": 0.07,
+        }
+
+    for label, rate in rates_to_test.items():
+        future_value_needed = amount * ((1 + rate) ** years)
+        purchasing_power_remaining = amount / ((1 + rate) ** years)
+        erosion = amount - purchasing_power_remaining
+
+        scenarios.append({
+            "scenario": label,
+            "inflation_rate": rate,
+            "future_value_needed": round(future_value_needed, 2),
+            "purchasing_power_remaining": round(purchasing_power_remaining, 2),
+            "value_eroded": round(erosion, 2),
+            "percent_eroded": round((erosion / amount) * 100, 2),
+        })
+
+    return {
+        "amount": amount,
+        "years": years,
+        "scenarios": scenarios,
+        "interpretation": (
+            f"${amount:,.0f} today may only be worth "
+            f"${scenarios[1]['purchasing_power_remaining']:,.0f} "
+            f"in {years} years at historical inflation rates."
+        ),
+    }
+
+
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
+
+@app.get("/health", tags=["System"])
+def health_check():
+    return {
+        "status": "ok",
+        "version": "1.0.0",
+        "current_cpi": CURRENT_CPI,
+        "current_month": CURRENT_MONTH,
+        "data_years": list(CPI_DATA.keys()),
+        "time": datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/v1/purchasing-power", tags=["Purchasing Power"])
+def purchasing_power(
+    amount: float = Query(..., description="Original dollar amount", gt=0),
+    year: int = Query(..., description="Year the amount was from (1913-2025)", ge=1913, le=2025),
+    to_year: int = Query(2026, description="Target year to adjust to", ge=1913, le=2026),
+):
+    """
+    Calculate what an amount from one year is worth in another year's dollars.
+    Example: /v1/purchasing-power?amount=1000000&year=2013&to_year=2026
+    """
+    return inflation_adjust(amount, year, to_year)
+
+
+@app.get("/v1/wealth-erosion", tags=["Wealth Simulator"])
+def wealth_erosion(
+    principal: float = Query(..., description="Initial investment amount", gt=0),
+    years: int = Query(..., description="Number of years to simulate", ge=1, le=50),
+    asset_class: str = Query(
+        "stocks_sp500",
+        description="Asset class to simulate",
+    ),
+    inflation_scenario: str = Query(
+        "official_cpi",
+        description="Inflation scenario to use",
+    ),
+):
+    """
+    Compare nominal vs. real (inflation-adjusted) returns for various asset classes.
+    See how much of your wealth is really "eroding" in purchasing power.
+    Example: /v1/wealth-erosion?principal=1000000&years=20&asset_class=stocks_sp500
+    """
+    return wealth_erosion_simulation(principal, years, asset_class, inflation_scenario)
+
+
+@app.get("/v1/future-projection", tags=["Future Projections"])
+def future_projection_endpoint(
+    amount: float = Query(..., description="Current dollar amount", gt=0),
+    years: int = Query(..., description="Years into the future", ge=1, le=50),
+    inflation_rate: Optional[float] = Query(
+        None,
+        description="Custom inflation rate (leave blank for standard scenarios)",
+        ge=0,
+        le=0.50,
+    ),
+):
+    """
+    Project how inflation will erode purchasing power over time.
+    Shows multiple scenarios: 2%, 3.1%, 5%, 8%.
+    Example: /v1/future-projection?amount=1000000&years=10
+    """
+    return future_projection(amount, years, inflation_rate)
+
+
+@app.get("/v1/million-shrinking", tags=["The Shrinking Million"])
+def million_shrinking():
+    """
+    The signature endpoint: what does $1M from key years buy today?
+    Shows the iconic "shrinking million" visual data.
+    """
+    key_years = [2000, 2005, 2010, 2013, 2015, 2020, 2025]
+    results = []
+    for yr in key_years:
+        adj = inflation_adjust(1_000_000, yr, 2026)
+        results.append({
+            "year": yr,
+            "million_then": 1_000_000,
+            "worth_today": adj["adjusted_value"],
+            "percent_change": adj["percent_change"],
+            "cpi_then": adj["original_cpi"],
+            "cpi_now": adj["target_cpi"],
+        })
+
+    # Current CPI note
+    return {
+        "title": "The Shrinking Million",
+        "description": "What $1,000,000 from key years is worth in Apr 2026 dollars",
+        "current_cpi": CURRENT_CPI,
+        "current_month": CURRENT_MONTH,
+        "data": results,
+        "interpretation": (
+            f"A 'Million Dollars' in 2013 is worth only "
+            f"${results[3]['worth_today']:,.0f} today. "
+            f"The million-dollar milestone keeps moving further away."
+        ),
+    }
+
+
+@app.get("/v1/asset-classes", tags=["Reference"])
+def list_asset_classes():
+    """List all available asset classes and their return characteristics."""
+    return {
+        "asset_classes": {
+            k: {kk: vv for kk, vv in v.items() if kk != "description"}
+            for k, v in ASSET_CLASSES.items()
+        }
+    }
+
+
+@app.get("/v1/inflation-categories", tags=["Reference"])
+def list_inflation_categories():
+    """List available inflation scenarios/categories."""
+    return {
+        "inflation_categories": CATEGORY_INFLATION,
+        "note": "Annual inflation rates by category. Used for scenario projections.",
+    }
+
+
+# =============================================================================
+# DASHBOARD — Embeddable frontend
+# =============================================================================
+
+@app.get("/dashboard", response_class=HTMLResponse, tags=["Dashboard"])
+def dashboard():
+    """Interactive embeddable dashboard for the Shrinking Million."""
+    return HTMLResponse(content=_DASHBOARD_HTML, status_code=200)
+
+
+# =============================================================================
+# STATIC FILES
+# =============================================================================
+
+import os
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+os.makedirs(static_dir, exist_ok=True)
+
+# Serve dashboard at /dashboard already handled above
+
+# =============================================================================
+# RUN
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

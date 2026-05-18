@@ -1,0 +1,7 @@
+milliondollarstoday-api/
+├── main.py              # FastAPI app — all endpoints
+├── requirements.txt     # Python dependencies
+├── Dockerfile           # Containerized deployment
+├── vercel.json          # Vercel serverless config
+└── static/
+    └── dashboard.html   # Interactive frontend (embeddable)
