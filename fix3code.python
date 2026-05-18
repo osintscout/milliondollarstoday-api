@@ -1,0 +1,220 @@
+"""
+MillionDollarsToday.com — Purchasing Power & Wealth Tracker API
+Vercel serverless entry point.
+"""
+import json
+import math
+import os
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+
+# =============================================================================
+# APP
+# =============================================================================
+
+app = FastAPI(
+    title="MillionDollarsToday — Purchasing Power API",
+    description="Real-world inflation-adjusted wealth tracker for consumers and small investors.",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =============================================================================
+# CPI DATA
+# =============================================================================
+
+CPI_DATA = {
+    1913: 9.9, 1914: 10.0, 1915: 10.1, 1916: 10.9, 1917: 12.8,
+    1918: 15.1, 1919: 17.3, 1920: 20.0, 1921: 17.9, 1922: 16.8,
+    1923: 17.1, 1924: 17.1, 1925: 17.5, 1926: 17.7, 1927: 17.4,
+    1928: 17.1, 1929: 17.1, 1930: 16.7, 1931: 15.2, 1932: 13.7,
+    1933: 13.0, 1934: 13.4, 1935: 13.7, 1936: 13.9, 1937: 14.4,
+    1938: 14.1, 1939: 13.9, 1940: 14.0, 1941: 14.7, 1942: 16.3,
+    1943: 17.3, 1944: 17.6, 1945: 18.0, 1946: 19.5, 1947: 22.3,
+    1948: 24.1, 1949: 23.8, 1950: 24.1, 1951: 26.0, 1952: 26.5,
+    1953: 26.7, 1954: 26.9, 1955: 26.8, 1956: 27.2, 1957: 28.1,
+    1958: 28.9, 1959: 29.1, 1960: 29.6, 1961: 29.9, 1962: 30.2,
+    1963: 30.6, 1964: 31.0, 1965: 31.5, 1966: 32.4, 1967: 33.4,
+    1968: 34.8, 1969: 36.7, 1970: 38.8, 1971: 40.5, 1972: 41.8,
+    1973: 44.4, 1974: 49.3, 1975: 53.8, 1976: 56.9, 1977: 60.6,
+    1978: 65.2, 1979: 72.6, 1980: 82.4, 1981: 90.9, 1982: 96.5,
+    1983: 99.6, 1984: 103.9, 1985: 107.6, 1986: 109.6, 1987: 113.6,
+    1988: 118.3, 1989: 124.0, 1990: 130.7, 1991: 136.2, 1992: 140.3,
+    1993: 144.5, 1994: 148.2, 1995: 152.4, 1996: 156.9, 1997: 160.5,
+    1998: 163.0, 1999: 166.6, 2000: 172.2, 2001: 177.1, 2002: 179.9,
+    2003: 184.0, 2004: 188.9, 2005: 195.3, 2006: 201.6, 2007: 207.3,
+    2008: 215.3, 2009: 214.5, 2010: 218.1, 2011: 224.9, 2012: 229.6,
+    2013: 233.0, 2014: 236.7, 2015: 237.0, 2016: 240.0, 2017: 245.1,
+    2018: 251.1, 2019: 255.7, 2020: 258.8, 2021: 271.0, 2022: 292.7,
+    2023: 304.7, 2024: 313.7, 2025: 321.9,
+}
+
+CURRENT_CPI = 333.02
+CURRENT_MONTH = "Apr 2026"
+
+ASSET_CLASSES = {
+    "stocks_sp500": {"name": "S&P 500 (Stocks)", "nominal_return": 0.10, "real_return": 0.069, "volatility": 0.155},
+    "bonds_10yr": {"name": "10-Year Treasury Bonds", "nominal_return": 0.053, "real_return": 0.022, "volatility": 0.070},
+    "real_estate": {"name": "Real Estate (Case-Shiller)", "nominal_return": 0.065, "real_return": 0.034, "volatility": 0.090},
+    "gold": {"name": "Gold", "nominal_return": 0.081, "real_return": 0.050, "volatility": 0.145},
+    "crypto_bitcoin": {"name": "Bitcoin (Crypto)", "nominal_return": 0.50, "real_return": 0.47, "volatility": 0.80},
+    "cash": {"name": "Cash / Savings", "nominal_return": 0.025, "real_return": -0.006, "volatility": 0.005},
+}
+
+CATEGORY_INFLATION = {
+    "official_cpi": 0.031, "food": 0.045, "housing": 0.050,
+    "healthcare": 0.060, "energy": 0.040, "education": 0.055,
+    "transportation": 0.035, "prepper_basket": 0.070,
+}
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def get_cpi(year: int) -> float:
+    cpi = CPI_DATA.get(year)
+    if cpi is None:
+        raise HTTPException(status_code=404, detail=f"No CPI data for year {year}")
+    return cpi
+
+def inflation_adjust(amount: float, from_year: int, to_year: int) -> dict:
+    cpi_from = get_cpi(from_year)
+    cpi_to = get_cpi(to_year) if to_year in CPI_DATA else CURRENT_CPI
+    ratio = cpi_to / cpi_from
+    adjusted = round(amount * ratio, 2)
+    return {
+        "original_amount": amount,
+        "original_year": from_year,
+        "target_year": to_year,
+        "original_cpi": cpi_from,
+        "target_cpi": cpi_to,
+        "adjusted_value": adjusted,
+        "purchasing_power_lost": round(max(0, amount - adjusted), 2),
+        "percent_change": round((ratio - 1) * 100, 2),
+        "ratio": round(ratio, 4),
+        "interpretation": f"${amount:,.0f} in {from_year} has the same purchasing power as ${adjusted:,.0f} in {to_year}.",
+    }
+
+def wealth_erosion_simulation(principal: float, years: int, asset_class: str, inflation_scenario: str = "official_cpi") -> dict:
+    asset = ASSET_CLASSES.get(asset_class)
+    if not asset:
+        raise HTTPException(status_code=404, detail=f"Unknown asset class: {asset_class}")
+    annual_inflation = CATEGORY_INFLATION.get(inflation_scenario, CATEGORY_INFLATION["official_cpi"])
+    yearly = []
+    for y in range(1, years + 1):
+        nominal = principal * ((1 + asset["nominal_return"]) ** y)
+        real = principal * ((1 + asset["real_return"]) ** y)
+        inflated = principal * ((1 + annual_inflation) ** y)
+        yearly.append({"year": y, "nominal_value": round(nominal, 2), "real_value": round(real, 2), "inflation_eroded_purchasing_power": round(inflated, 2)})
+    final = yearly[-1]
+    return {
+        "principal": principal,
+        "asset_class": asset["name"],
+        "years": years,
+        "inflation_scenario": inflation_scenario,
+        "inflation_rate": annual_inflation,
+        "nominal_return_rate": asset["nominal_return"],
+        "real_return_rate": asset["real_return"],
+        "final_nominal_value": final["nominal_value"],
+        "final_real_value": final["real_value"],
+        "inflation_eroded_value_needed": final["inflation_eroded_purchasing_power"],
+        "yearly": yearly,
+        "interpretation": f"If you invested ${principal:,.0f} in {asset['name']} for {years} years, it would grow to ${final['nominal_value']:,.0f} nominally, but be worth ${final['real_value']:,.0f} in today's dollars.",
+    }
+
+def future_projection(amount: float, years: int) -> dict:
+    scenarios = [
+        {"scenario": "Low (2% — Fed target)", "rate": 0.02},
+        {"scenario": "Moderate (3.1% — historical avg)", "rate": 0.031},
+        {"scenario": "High (5% — persistent)", "rate": 0.05},
+        {"scenario": "Extreme (8% — 2022-style)", "rate": 0.08},
+        {"scenario": "Prepper Basket (7%)", "rate": 0.07},
+    ]
+    results = []
+    for s in scenarios:
+        needed = amount * ((1 + s["rate"]) ** years)
+        remaining = amount / ((1 + s["rate"]) ** years)
+        results.append({
+            "scenario": s["scenario"],
+            "inflation_rate": s["rate"],
+            "future_value_needed": round(needed, 2),
+            "purchasing_power_remaining": round(remaining, 2),
+            "value_eroded": round(amount - remaining, 2),
+            "percent_eroded": round(((amount - remaining) / amount) * 100, 2),
+        })
+    return {"amount": amount, "years": years, "scenarios": results}
+
+# =============================================================================
+# ENDPOINTS
+# =============================================================================
+
+@app.get("/")
+def root():
+    return {
+        "name": "MillionDollarsToday — Purchasing Power API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "dashboard": "/dashboard",
+        "endpoints": {
+            "purchasing_power": "/v1/purchasing-power?amount=1000000&year=2013&to_year=2026",
+            "wealth_erosion": "/v1/wealth-erosion?principal=1000000&years=20&asset_class=stocks_sp500",
+            "future_projection": "/v1/future-projection?amount=1000000&years=10",
+            "million_shrinking": "/v1/million-shrinking",
+            "health": "/health",
+        }
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "current_cpi": CURRENT_CPI, "month": CURRENT_MONTH, "data_years": [1913, 2025]}
+
+@app.get("/v1/purchasing-power")
+def purchasing_power(amount: float = Query(..., gt=0), year: int = Query(..., ge=1913, le=2025), to_year: int = Query(2026, ge=1913, le=2026)):
+    return inflation_adjust(amount, year, to_year)
+
+@app.get("/v1/wealth-erosion")
+def wealth_erosion(principal: float = Query(..., gt=0), years: int = Query(..., ge=1, le=50), asset_class: str = "stocks_sp500", inflation_scenario: str = "official_cpi"):
+    return wealth_erosion_simulation(principal, years, asset_class, inflation_scenario)
+
+@app.get("/v1/future-projection")
+def future_projection_endpoint(amount: float = Query(..., gt=0), years: int = Query(..., ge=1, le=50)):
+    return future_projection(amount, years)
+
+@app.get("/v1/million-shrinking")
+def million_shrinking():
+    key_years = [2000, 2005, 2010, 2013, 2015, 2020, 2025]
+    data = []
+    for yr in key_years:
+        adj = inflation_adjust(1_000_000, yr, 2026)
+        data.append({"year": yr, "million_then": 1_000_000, "worth_today": adj["adjusted_value"], "cpi_then": adj["original_cpi"], "cpi_now": adj["target_cpi"]})
+    return {"title": "The Shrinking Million", "current_cpi": CURRENT_CPI, "month": CURRENT_MONTH, "data": data}
+
+@app.get("/v1/asset-classes")
+def list_asset_classes():
+    return {"asset_classes": {k: v for k, v in ASSET_CLASSES.items()}}
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    static_path = os.path.join(os.path.dirname(dir_path), "static", "dashboard.html")
+    alt_path = os.path.join(dir_path, "..", "static", "dashboard.html")
+    if os.path.exists(static_path):
+        with open(static_path) as f:
+            return f.read()
+    elif os.path.exists(alt_path):
+        with open(alt_path) as f:
+            return f.read()
+    return HTMLResponse("<h1>Dashboard not found</h1><p>static/dashboard.html is missing.</p>", status_code=404)

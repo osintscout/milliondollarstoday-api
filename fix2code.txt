@@ -1,0 +1,7 @@
+milliondollarstoday-api/
+├── api/
+│   └── index.py          # The main app — THIS is what Vercel needs
+├── static/
+│   └── dashboard.html     # Frontend asset
+├── requirements.txt       # Dependencies
+└── vercel.json            # Routing config
